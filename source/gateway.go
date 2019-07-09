@@ -40,7 +40,6 @@ import (
 type gatewaySource struct {
 	kubeClient                  kubernetes.Interface
 	istioClient                 istiomodel.ConfigStore
-	istioIngressGatewayServices []string
 	namespace                   string
 	annotationFilter            string
 	fqdnTemplate                *template.Template
@@ -52,7 +51,6 @@ type gatewaySource struct {
 func NewIstioGatewaySource(
 	kubeClient kubernetes.Interface,
 	istioClient istiomodel.ConfigStore,
-	istioIngressGatewayServices []string,
 	namespace string,
 	annotationFilter string,
 	fqdnTemplate string,
@@ -63,11 +61,6 @@ func NewIstioGatewaySource(
 		tmpl *template.Template
 		err  error
 	)
-	for _, lbService := range istioIngressGatewayServices {
-		if _, _, err = parseIngressGateway(lbService); err != nil {
-			return nil, err
-		}
-	}
 
 	if fqdnTemplate != "" {
 		tmpl, err = template.New("endpoint").Funcs(template.FuncMap{
@@ -81,7 +74,6 @@ func NewIstioGatewaySource(
 	return &gatewaySource{
 		kubeClient:                  kubeClient,
 		istioClient:                 istioClient,
-		istioIngressGatewayServices: istioIngressGatewayServices,
 		namespace:                   namespace,
 		annotationFilter:            annotationFilter,
 		fqdnTemplate:                tmpl,
@@ -167,8 +159,10 @@ func (sc *gatewaySource) endpointsFromTemplate(config *istiomodel.Config) ([]*en
 
 	targets := getTargetsFromTargetAnnotation(config.Annotations)
 
+	gateway := config.Spec.(*istionetworking.Gateway)
+
 	if len(targets) == 0 {
-		targets, err = sc.targetsFromIstioIngressGatewayServices()
+		targets, err = sc.targetsFromIstioIngressGatewayServices(*gateway)
 		if err != nil {
 			return nil, err
 		}
@@ -223,21 +217,21 @@ func (sc *gatewaySource) setResourceLabel(config istiomodel.Config, endpoints []
 	}
 }
 
-func (sc *gatewaySource) targetsFromIstioIngressGatewayServices() (targets endpoint.Targets, err error) {
-	for _, lbService := range sc.istioIngressGatewayServices {
-		lbNamespace, lbName, err := parseIngressGateway(lbService)
-		if err != nil {
-			return nil, err
-		}
-		if svc, err := sc.kubeClient.CoreV1().Services(lbNamespace).Get(lbName, metav1.GetOptions{}); err != nil {
+func (sc *gatewaySource) targetsFromIstioIngressGatewayServices(gateway istionetworking.Gateway) (targets endpoint.Targets, err error) {
+	for key, lbService := range gateway.Selector {
+		if selectList, err := sc.kubeClient.CoreV1().Services("").List(metav1.ListOptions{
+			LabelSelector: key + "=" + lbService,
+		}); err != nil {
 			log.Warn(err)
 		} else {
-			for _, lb := range svc.Status.LoadBalancer.Ingress {
-				if lb.IP != "" {
-					targets = append(targets, lb.IP)
-				}
-				if lb.Hostname != "" {
-					targets = append(targets, lb.Hostname)
+			for _, svc := range selectList.Items {	
+				for _, lb := range svc.Status.LoadBalancer.Ingress {
+					if lb.IP != "" {
+						targets = append(targets, lb.IP)
+					}
+					if lb.Hostname != "" {
+						targets = append(targets, lb.Hostname)
+					}
 				}
 			}
 		}
@@ -257,14 +251,14 @@ func (sc *gatewaySource) endpointsFromGatewayConfig(config istiomodel.Config) ([
 
 	targets := getTargetsFromTargetAnnotation(config.Annotations)
 
+	gateway := config.Spec.(*istionetworking.Gateway)
+
 	if len(targets) == 0 {
-		targets, err = sc.targetsFromIstioIngressGatewayServices()
+		targets, err = sc.targetsFromIstioIngressGatewayServices(*gateway)
 		if err != nil {
 			return nil, err
 		}
 	}
-
-	gateway := config.Spec.(*istionetworking.Gateway)
 
 	providerSpecific := getProviderSpecificAnnotations(config.Annotations)
 
@@ -286,15 +280,4 @@ func (sc *gatewaySource) endpointsFromGatewayConfig(config istiomodel.Config) ([
 	}
 
 	return endpoints, nil
-}
-
-func parseIngressGateway(ingressGateway string) (namespace, name string, err error) {
-	parts := strings.Split(ingressGateway, "/")
-	if len(parts) != 2 {
-		err = fmt.Errorf("invalid ingress gateway service (namespace/name) found '%v'", ingressGateway)
-	} else {
-		namespace, name = parts[0], parts[1]
-	}
-
-	return
 }
